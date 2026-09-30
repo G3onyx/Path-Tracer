@@ -1,0 +1,126 @@
+#version 450 core
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba32f, binding = 0) uniform writeonly image2D accumImage;
+uniform sampler2D noisyTexture;
+uniform sampler2D historyImage;
+
+uniform ivec2 resolution;
+uniform bool useTAA;
+uniform int frameCount, accumCount;
+uniform mat4 prevPV;
+uniform vec2 prevRenderScale;
+uniform bool useCheckerboard;
+
+uniform vec3 camPos;
+uniform vec3 camForward;
+uniform vec3 camRight;
+uniform vec3 camUp;
+uniform vec2 rayScale;
+
+
+// https://en.wikipedia.org/wiki/Relative_luminance
+const vec3 LUM = vec3(0.2126, 0.7152, 0.0722);
+float getLuminance(vec3 c) {
+    return dot(c, LUM);
+}
+
+void main() {
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    if (pixelCoord.x >= resolution.x || pixelCoord.y >= resolution.y) return;
+
+    vec4 noisyData;
+
+    // Fetch raw path traced data
+    bool skipped = false;
+    if (useCheckerboard) {
+        bool isEvenFrame = (frameCount % 2 == 0);
+        bool isEvenPixel = ((pixelCoord.x + pixelCoord.y) % 2 == 0);
+        
+        if (isEvenFrame != isEvenPixel) {
+            skipped = true;
+            vec4 t = texelFetch(noisyTexture, clamp(pixelCoord + ivec2(0, 1), ivec2(0), resolution - ivec2(1)), 0);
+            vec4 b = texelFetch(noisyTexture, clamp(pixelCoord + ivec2(0, -1), ivec2(0), resolution - ivec2(1)), 0);
+            vec4 l = texelFetch(noisyTexture, clamp(pixelCoord + ivec2(-1, 0), ivec2(0), resolution - ivec2(1)), 0);
+            vec4 r = texelFetch(noisyTexture, clamp(pixelCoord + ivec2(1, 0), ivec2(0), resolution - ivec2(1)), 0);
+            noisyData = (t + b + l + r) * 0.25;
+        }
+    }
+
+    if (!skipped) noisyData = texelFetch(noisyTexture, pixelCoord, 0);
+
+    
+    vec3 radiance = noisyData.rgb;
+    float depth = noisyData.a;
+
+    // Safety checks and firefly clamping
+    if (any(isnan(radiance)) || any(isinf(radiance))) radiance = vec3(0.0);
+
+    radiance = clamp(radiance, 0.0, useTAA ? 4.0 : 1000.0);
+
+    vec3 smoothRadiance;
+
+    if (!useTAA) {
+        vec3 historyColour = texelFetch(historyImage, pixelCoord, 0).rgb;
+        float currentAccum = min(float(accumCount), 1000.0); // convergence_frames=1000
+        float alpha = (currentAccum - 1.0) / currentAccum;
+        smoothRadiance = mix(radiance, historyColour, alpha);
+    }
+    else {
+        // Reconstruct world position from depth
+        vec2 uv = (vec2(pixelCoord) + 0.5) / vec2(resolution);
+        vec2 p = uv * 2.0 - 1.0;
+        vec3 rayDir = normalize(camForward + camRight * p.x * rayScale.x + camUp * p.y * rayScale.y);
+        vec3 worldPos = camPos + rayDir * depth;
+
+        // Temporal reprojection
+        bool onScreen = false;
+        vec2 prevUV = vec2(0.0);
+
+        vec4 prevClip = prevPV * vec4(worldPos, 1.0);
+        if (prevClip.w > 0.0) {
+            vec2 screenUV = (prevClip.xyz / prevClip.w).xy * 0.5 + 0.5;
+            prevUV = screenUV * prevRenderScale;
+
+            vec2 texSize = vec2(textureSize(historyImage, 0));
+            vec2 maxPrevUV = prevRenderScale - (0.5 / texSize);
+            prevUV = clamp(prevUV, vec2(0.5) / texSize, maxPrevUV);
+
+            onScreen = all(greaterThanEqual(screenUV, vec2(0.0))) && all(lessThanEqual(screenUV, vec2(1.0)));
+            
+            // Disocclusion check
+            if (onScreen) {
+                float oldDepth = texture(historyImage, prevUV).w;
+                if (abs(depth - oldDepth) > depth * 0.1) onScreen = false; 
+            }
+        }
+
+        if (!onScreen) {
+            smoothRadiance = radiance;
+        } else {
+            // RGB neighborhood sampling
+            vec3 cCenter = radiance;
+            vec3 cTop    = texelFetch(noisyTexture, clamp(pixelCoord + ivec2(0, 1), ivec2(0), resolution - ivec2(1)), 0).rgb;
+            vec3 cBottom = texelFetch(noisyTexture, clamp(pixelCoord + ivec2(0, -1), ivec2(0), resolution - ivec2(1)), 0).rgb;
+            vec3 cLeft   = texelFetch(noisyTexture, clamp(pixelCoord + ivec2(-1, 0), ivec2(0), resolution - ivec2(1)), 0).rgb;
+            vec3 cRight  = texelFetch(noisyTexture, clamp(pixelCoord + ivec2(1, 0), ivec2(0), resolution - ivec2(1)), 0).rgb;
+
+            // Min/max AABB clipping
+            vec3 minColor = min(cCenter, min(cTop, min(cBottom, min(cLeft, cRight))));
+            vec3 maxColor = max(cCenter, max(cTop, max(cBottom, max(cLeft, cRight))));
+
+            vec3 historyColour = texture(historyImage, prevUV).rgb;
+            historyColour = clamp(historyColour, minColor, maxColor);
+
+            // Karis averaging
+            vec3 mappedRad = radiance / (1.0 + getLuminance(radiance));
+            vec3 mappedHist = historyColour / (1.0 + getLuminance(historyColour));
+            vec3 mappedResult = mix(mappedRad, mappedHist, 0.9); // alpha=0.9
+            
+            smoothRadiance = mappedResult / max(1.0 - getLuminance(mappedResult), 0.0001);
+        }
+    }
+
+    imageStore(accumImage, pixelCoord, vec4(smoothRadiance, depth));
+}

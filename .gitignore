@@ -1,0 +1,18 @@
+# Visual Studio & C++ Build Cache
+.vs/
+x64/
+Debug/
+Release/
+*.user
+*.pdb
+*.ipch
+*.exe
+*.dll
+
+# Keep source files and project solution
+!code/
+!include/
+!lib/
+!shaders/
+!res/
+!renders/
